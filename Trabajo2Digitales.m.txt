@@ -1,0 +1,1129 @@
+%% =====================================================================
+%  PROYECTO II - Simulacion de un sistema de comunicacion digital
+%  Universidad del Cauca - Comunicaciones Digitales
+%  Archivo unico: las PARTES van arriba y las FUNCIONES al final.
+%  (Las funciones locales deben ir siempre despues de todo el codigo
+%   del script; al agregar partes nuevas, insertalas antes de "FUNCIONES".)
+%  Requiere MATLAB R2016b o posterior.
+%
+%  PARTE 1: mapeo (Gray)            PARTE 3: pulsos SRRC, ojo, constelacion
+%  PARTE 2: canal AWGN, decisor, BER PARTE 4: portadora, demodulacion, espectros
+%  PARTE 5: metricas (Es, B, eficiencia, potencia)
+%  PARTE 6: BER vs Eb/N0 y tabla de diferencias de Eb/N0 (4PAM, 4QAM, 4PSK)
+%  PARTE 7: interfaz grafica interactiva (RF1, RF2, RF3, RF4, RNF1)
+%
+%  Este archivo es una FUNCION principal (Trabajo2Digitales) seguida de sus
+%  funciones locales. Se ejecuta con el boton Run o escribiendo
+%  Trabajo2Digitales en la ventana de comandos.
+% =====================================================================
+function Trabajo2Digitales()
+clc; close all;
+rng(1);                              % semilla fija (RNF3: reproducibilidad)
+
+correr_parte1 = true;                % pon false para saltarte una parte
+correr_parte2 = true;                % (la parte 2 es la mas lenta)
+correr_parte3 = true;
+correr_parte4 = true;
+correr_parte5 = true;
+correr_parte6 = true;                % (la parte 6 tarda unos minutos)
+correr_parte7 = true;                % interfaz grafica
+
+solo_interfaz = true;                % true: abre solo la interfaz (partes 1 a 6 desactivadas)
+if solo_interfaz                     % false: ejecuta tambien las partes 1 a 6 con las banderas de arriba
+    correr_parte1 = false;  correr_parte2 = false;  correr_parte3 = false;
+    correr_parte4 = false;  correr_parte5 = false;  correr_parte6 = false;
+end
+
+% ---------- Parametros del sistema para las partes 3, 4 y 5 ----------
+P.esq  = 'QAM';      % 'PAM', 'QAM' o 'PSK'
+P.M    = 4;          % orden de la modulacion
+P.beta = 0.35;       % factor de roll-off (0 a 1)
+P.sps  = 8;          % muestras por simbolo
+P.span = 10;         % largo del filtro SRRC en simbolos
+P.fc   = 2;          % portadora en unidades de 1/Ts (Rs). Parte 4
+P.EbN0 = 12;         % Eb/N0 (dB) para ojo, constelacion y espectros
+P.N    = 4000;       % simbolos para las graficas
+
+%% =====================================================================
+%  PARTE 1 - Mapeo bits -> simbolos (Gray), Es = 1
+% =====================================================================
+if correr_parte1
+    config = {'PAM',4; 'QAM',4; 'PSK',4; 'PAM',8; 'PSK',8; 'QAM',16};
+    figure('Name','Parte 1 - Constelaciones','Position',[100 100 1000 600]);
+
+    for c = 1:size(config,1)
+        esq = config{c,1};  M = config{c,2};  k = log2(M);
+
+        [s, Bmat] = constelacion(M, esq);          % todos los simbolos y sus bits
+
+        Es = mean(abs(s).^2);                      % energia promedio por simbolo
+        Eb = Es / k;
+
+        % Distancia minima y comprobacion de Gray entre vecinos
+        D = abs(s - s.');
+        D(1:M+1:end) = Inf;
+        dmin = min(D(:));
+        gray_ok = true;
+        for i = 1:M-1
+            for j = i+1:M
+                if abs(D(i,j) - dmin) < 1e-9 && sum(Bmat(i,:) ~= Bmat(j,:)) ~= 1
+                    gray_ok = false;
+                end
+            end
+        end
+        if gray_ok, txt = 'SI'; else, txt = 'NO'; end
+        fprintf('%2d-%s: Es = %.4f | Eb = %.4f | dmin = %.4f | Gray: %s\n', ...
+                M, esq, Es, Eb, dmin, txt);
+
+        subplot(2,3,c);
+        plot(real(s), imag(s), 'bo', 'MarkerFaceColor','b'); hold on;
+        for m = 1:M
+            text(real(s(m))+0.04, imag(s(m))+0.06, char(Bmat(m,:)+'0'));
+        end
+        grid on; axis equal; xlim([-1.6 1.6]); ylim([-1.6 1.6]);
+        xlabel('I'); ylabel('Q'); title(sprintf('%d-%s', M, esq));
+    end
+
+    % Manejo de errores (RNF1)
+    try, mapear([0 1 0], 3, 'PSK');
+    catch err, fprintf('Error controlado (M=3): %s\n', err.message); end
+    try, mapear([0 1 0 1 1 1 0 0], 8, 'QAM');
+    catch err, fprintf('Error controlado (8-QAM): %s\n', err.message); end
+end
+
+%% =====================================================================
+%  PARTE 2 - Canal AWGN + decisor + BER vs Eb/N0 (simbolos directos)
+% =====================================================================
+if correr_parte2
+    EbN0_dB  = 0:1:9;
+    config2  = {'PAM',4,'4-PAM'; 'QAM',4,'4-QAM'; 'PSK',4,'4-PSK'};
+    nBitsMax = 5e6;                  % maximo de bits por punto
+    minErr   = 100;                  % errores minimos para confiar en el punto
+    colores  = {'b','r','g'};
+
+    figure('Name','Parte 2 - BER'); hold on;
+    for c = 1:size(config2,1)
+        esq = config2{c,1};  M = config2{c,2};  nombre = config2{c,3};
+        ber_sim = zeros(size(EbN0_dB));
+        ber_teo = zeros(size(EbN0_dB));
+        for i = 1:length(EbN0_dB)
+            ber_sim(i) = simular_ber(M, esq, EbN0_dB(i), nBitsMax, minErr);
+            ber_teo(i) = ber_teorica(M, esq, EbN0_dB(i));
+        end
+        semilogy(EbN0_dB, ber_teo, '-', 'Color', colores{c}, 'DisplayName', [nombre ' teoria']);
+        semilogy(EbN0_dB, ber_sim, 'o', 'Color', colores{c}, 'DisplayName', [nombre ' simulada']);
+
+        fprintf('\n%s\n  EbN0(dB)   BER sim      BER teo\n', nombre);
+        for i = 1:length(EbN0_dB)
+            fprintf('  %5.1f     %.3e    %.3e\n', EbN0_dB(i), ber_sim(i), ber_teo(i));
+        end
+    end
+    set(gca, 'YScale', 'log'); grid on; ylim([1e-6 1]);
+    xlabel('E_b/N_0 (dB)'); ylabel('BER');
+    title('BER vs E_b/N_0 (simbolos directos)'); legend('Location','southwest');
+end
+
+%% =====================================================================
+%  PARTE 3 - Conformacion SRRC, ojo, constelacion recibida y BER
+%  Cadena: bits -> simbolos -> pulso SRRC -> AWGN -> filtro adaptado
+%          -> muestreo -> decisor.
+% =====================================================================
+if correr_parte3
+    rng(3);                                         % misma semilla sin importar que partes corras
+    k = log2(P.M);
+
+    % ---- 3.1 Pulso SRRC y pulso total (coseno alzado) ----
+    h  = srrc(P.beta, P.sps, P.span);
+    g  = conv(h, h);                                % pulso total Tx+Rx
+    th = (-P.span*P.sps/2 : P.span*P.sps/2) / P.sps;
+    tg = (-P.span*P.sps   : P.span*P.sps  ) / P.sps;
+    centro = P.span*P.sps + 1;
+    isi = abs(g(centro + P.sps*(1:P.span)));        % g en t = Ts, 2Ts, ...
+    fprintf('\n--- PARTE 3 ---\n');
+    fprintf('Energia de h: %.4f (debe ser 1)\n', sum(h.^2));
+    fprintf('g(0) = %.4f (debe ser ~1)\n', g(centro));
+    fprintf('Maximo |g(nTs)|, n>=1: %.2e (ISI residual, debe ser pequeno)\n', max(isi));
+
+    figure('Name','Parte 3 - Pulsos');
+    subplot(2,1,1); plot(th, h, 'b'); grid on;
+    title(sprintf('SRRC, \\beta = %.2f', P.beta)); xlabel('t / T_s');
+    subplot(2,1,2); plot(tg, g, 'r'); hold on; grid on;
+    plot(-P.span:P.span, g(centro + P.sps*(-P.span:P.span)), 'ko', 'MarkerFaceColor','k');
+    title('Pulso total (SRRC*SRRC): ceros en multiplos de T_s'); xlabel('t / T_s');
+
+    % ---- 3.2 Transmision ----
+    bits = randi([0 1], 1, P.N*k);
+    s    = mapear(bits, P.M, P.esq);
+    x    = conformar(s, h, P.sps);
+
+    % ---- 3.3 Recepcion sin ruido (debe recuperar los simbolos) ----
+    [y0, s0] = receptor_adaptado(x, h, P.sps, P.span, P.N);
+    fprintf('Error maximo de simbolos sin ruido: %.2e (pequeno, por ISI de truncado)\n', max(abs(s0 - s)));
+
+    % ---- 3.4 Recepcion con ruido ----
+    r = canal_awgn(x, P.EbN0, k);
+    [y, ys] = receptor_adaptado(r, h, P.sps, P.span, P.N);
+
+    % ---- 3.5 Diagramas del ojo ----
+    figure('Name','Parte 3 - Ojo sin ruido');
+    if isreal(y0)
+        plot_ojo(real(y0), P.sps, P.span, 300, 'Ojo (sin ruido)');
+    else
+        subplot(1,2,1); plot_ojo(real(y0), P.sps, P.span, 300, 'Ojo I (sin ruido)');
+        subplot(1,2,2); plot_ojo(imag(y0), P.sps, P.span, 300, 'Ojo Q (sin ruido)');
+    end
+    figure('Name','Parte 3 - Ojo con ruido');
+    if isreal(y)
+        plot_ojo(real(y), P.sps, P.span, 300, sprintf('Ojo (E_b/N_0 = %g dB)', P.EbN0));
+    else
+        subplot(1,2,1); plot_ojo(real(y), P.sps, P.span, 300, sprintf('Ojo I (E_b/N_0 = %g dB)', P.EbN0));
+        subplot(1,2,2); plot_ojo(imag(y), P.sps, P.span, 300, sprintf('Ojo Q (E_b/N_0 = %g dB)', P.EbN0));
+    end
+
+    % ---- 3.6 Constelacion recibida ----
+    C = constelacion(P.M, P.esq);
+    figure('Name','Parte 3 - Constelacion recibida');
+    plot(real(ys), imag(ys), '.', 'Color', [0.3 0.5 0.9]); hold on;
+    plot(real(C), imag(C), 'r+', 'MarkerSize', 12, 'LineWidth', 2);
+    grid on; axis equal; xlabel('I'); ylabel('Q');
+    title(sprintf('Constelacion recibida %d-%s (E_b/N_0 = %g dB)', P.M, P.esq, P.EbN0));
+
+    % ---- 3.7 BER: con pulsos vs simbolos directos vs teoria ----
+    EbN0_dB = 0:2:8;
+    ber_p = zeros(size(EbN0_dB)); ber_s = ber_p; ber_t = ber_p;
+    for i = 1:length(EbN0_dB)
+        ber_p(i) = simular_ber(P.M, P.esq, EbN0_dB(i), 2e6, 100, P.beta);
+        ber_s(i) = simular_ber(P.M, P.esq, EbN0_dB(i), 2e6, 100);
+        ber_t(i) = ber_teorica(P.M, P.esq, EbN0_dB(i));
+    end
+    fprintf('\nEbN0(dB)  BER con pulsos   BER simbolos   BER teoria\n');
+    for i = 1:length(EbN0_dB)
+        fprintf('  %4.1f     %.3e       %.3e      %.3e\n', EbN0_dB(i), ber_p(i), ber_s(i), ber_t(i));
+    end
+    figure('Name','Parte 3 - BER');
+    semilogy(EbN0_dB, ber_t, 'k-', EbN0_dB, ber_s, 'bs', EbN0_dB, ber_p, 'r*');
+    grid on; xlabel('E_b/N_0 (dB)'); ylabel('BER');
+    legend('Teoria','Simbolos directos','Con pulsos SRRC','Location','southwest');
+    title(sprintf('%d-%s, \\beta = %.2f', P.M, P.esq, P.beta));
+end
+
+%% =====================================================================
+%  PARTE 4 - Modulacion a portadora, canal, demodulacion coherente, espectros
+%  Cadena: x(banda base) -> xp = sqrt(2)[xI cos - xQ sin] -> AWGN
+%          -> demodulacion coherente -> filtro adaptado -> muestreo -> decisor
+% =====================================================================
+if correr_parte4
+    rng(4);
+    k = log2(P.M);
+    fprintf('\n--- PARTE 4 ---\n');
+
+    % ---- Validacion de la portadora (RNF1) ----
+    media_bw = (1 + P.beta) / 2;                    % semiancho de banda en unidades de 1/Ts
+    if P.fc <= media_bw || P.fc >= P.sps/2 - media_bw
+        error(['La portadora fc debe cumplir (1+beta)/2 < fc < sps/2 - (1+beta)/2 ' ...
+               '(en unidades de 1/Ts). Con beta=%.2f y sps=%d: %.3f < fc < %.3f.'], ...
+               P.beta, P.sps, media_bw, P.sps/2 - media_bw);
+    end
+
+    h  = srrc(P.beta, P.sps, P.span);
+    bits = randi([0 1], 1, P.N*k);
+    s  = mapear(bits, P.M, P.esq);
+    x  = conformar(s, h, P.sps);                    % banda base (transmision)
+    xp = modular(x, P.fc, P.sps);                   % pasa banda (transmision)
+    fprintf('Energia por simbolo: banda base = %.4f | pasa banda = %.4f (deben coincidir)\n', ...
+            sum(abs(x).^2)/P.N, sum(xp.^2)/P.N);
+
+    % Sin ruido: debe recuperar los simbolos
+    [~, s0] = demodular(xp, P.fc, P.sps, h, P.span, P.N, P.esq);
+    fprintf('Error maximo de simbolos sin ruido: %.2e (pequeno, por ISI de truncado)\n', max(abs(s0 - s)));
+
+    % Con ruido
+    rp = canal_awgn(xp, P.EbN0, k);                 % senal pasa banda recibida
+    [~, ys] = demodular(rp, P.fc, P.sps, h, P.span, P.N, P.esq);
+    bitsRx = decisor(ys, P.M, P.esq);
+    fprintf('BER a %g dB con portadora (%d bits): %.3e | teoria: %.3e\n', ...
+            P.EbN0, length(bits), mean(bitsRx ~= bits), ber_teorica(P.M, P.esq, P.EbN0));
+
+    % ---- Espectros (RF3d): banda base en Tx y pasa banda en Rx ----
+    nfft = 1024;
+    [fb, Pb] = psd_welch(x,  P.sps, nfft);          % frecuencia en unidades de 1/Ts
+    [fp, Pp] = psd_welch(rp, P.sps, nfft);
+    figure('Name','Parte 4 - Espectros','Position',[100 100 1000 420]);
+    subplot(1,2,1);
+    plot(fb, Pb, 'b'); hold on; grid on;
+    xlim([-3 3]); ylim([-80 5]);
+    plot([-media_bw -media_bw], [-80 5], 'r--'); plot([media_bw media_bw], [-80 5], 'r--');
+    xlabel('f T_s'); ylabel('Densidad espectral (dB, normalizada)');
+    title(sprintf('Banda base en Tx (\\beta = %.2f)', P.beta));
+    subplot(1,2,2);
+    plot(fp, Pp, 'm'); hold on; grid on;
+    xlim([0 P.sps/2]); ylim([-80 5]);
+    plot([P.fc-media_bw P.fc-media_bw], [-80 5], 'r--'); plot([P.fc+media_bw P.fc+media_bw], [-80 5], 'r--');
+    xlabel('f T_s'); ylabel('Densidad espectral (dB, normalizada)');
+    title(sprintf('Pasa banda en Rx (f_c = %g/T_s, E_b/N_0 = %g dB)', P.fc, P.EbN0));
+
+    % ---- Constelacion tras demodulacion con portadora ----
+    C = constelacion(P.M, P.esq);
+    figure('Name','Parte 4 - Constelacion pasa banda');
+    plot(real(ys), imag(ys), '.', 'Color', [0.3 0.5 0.9]); hold on;
+    plot(real(C), imag(C), 'r+', 'MarkerSize', 12, 'LineWidth', 2);
+    grid on; axis equal; xlabel('I'); ylabel('Q');
+    title(sprintf('Constelacion tras demodular %d-%s (E_b/N_0 = %g dB)', P.M, P.esq, P.EbN0));
+
+    % ---- BER con portadora vs teoria ----
+    EbN0_dB = 0:2:8;
+    ber_c = zeros(size(EbN0_dB)); ber_t = ber_c;
+    for i = 1:length(EbN0_dB)
+        ber_c(i) = simular_ber(P.M, P.esq, EbN0_dB(i), 2e6, 100, P.beta, P.fc);
+        ber_t(i) = ber_teorica(P.M, P.esq, EbN0_dB(i));
+    end
+    fprintf('\nEbN0(dB)  BER con portadora   BER teoria\n');
+    for i = 1:length(EbN0_dB)
+        fprintf('  %4.1f     %.3e          %.3e\n', EbN0_dB(i), ber_c(i), ber_t(i));
+    end
+    figure('Name','Parte 4 - BER');
+    semilogy(EbN0_dB, ber_t, 'k-', EbN0_dB, ber_c, 'r*');
+    grid on; xlabel('E_b/N_0 (dB)'); ylabel('BER');
+    legend('Teoria','Con portadora (pasa banda)','Location','southwest');
+    title(sprintf('%d-%s, \\beta = %.2f, f_c = %g/T_s', P.M, P.esq, P.beta, P.fc));
+end
+
+%% =====================================================================
+%  PARTE 5 - Metricas (RF4): energia de simbolo, ancho de banda,
+%            eficiencia espectral y potencia de la senal modulada
+%  Definiciones (unidades normalizadas: Ts = 1, Rs = 1/Ts, Es = 1):
+%    Es  = energia promedio por simbolo   (medida: sum|x|^2 / N)
+%    Eb  = Es / k,   k = log2(M)
+%    Rb  = k * Rs                          (tasa de bits)
+%    B   = (1 + beta) * Rs                 (ancho de banda de la senal pasa banda)
+%    eta = Rb / B = k / (1 + beta)         (eficiencia espectral, bit/s/Hz)
+%    P   = Es * Rs = sum(xp^2) / (N*Ts)    (potencia promedio de la senal modulada)
+%    B99 = ancho que contiene el 99% de la potencia (medido del espectro)
+% =====================================================================
+if correr_parte5
+    rng(5);
+    fprintf('\n--- PARTE 5: METRICAS (Ts = 1, Es = 1; unidades normalizadas) ---\n');
+    validar_portadora(P.beta, P.fc, P.sps);
+
+    lista = {P.esq, P.M; 'PAM',4; 'QAM',4; 'PSK',4; 'PAM',8; 'PSK',8; 'QAM',16};
+    nL = size(lista, 1);
+    Nm = 20000;                                      % simbolos por esquema
+    h  = srrc(P.beta, P.sps, P.span);
+    etas = zeros(nL, 1);
+    nombres = cell(nL, 1);
+
+    fprintf('beta = %.2f, fc = %g/Ts  (* = configuracion actual P)\n', P.beta, P.fc);
+    fprintf('%-9s %2s %7s %7s %9s %11s %10s %7s %7s\n', ...
+            'Esquema','k','Es','Eb','Rb[1/Ts]','B=(1+b)/Ts','B99[1/Ts]','eta','P');
+    for c = 1:nL
+        esq_c = lista{c,1};  M_c = lista{c,2};  k_c = log2(M_c);
+        bits = randi([0 1], 1, Nm*k_c);
+        s  = mapear(bits, M_c, esq_c);
+        x  = conformar(s, h, P.sps);
+        xp = modular(x, P.fc, P.sps);
+        met = calcular_metricas(M_c, P.beta, x, xp, Nm, P.sps);
+
+        nombres{c} = sprintf('%d-%s', M_c, esq_c);
+        if c == 1, nombres{c} = [nombres{c} '*']; end
+        etas(c) = met.eta;
+        fprintf('%-9s %2d %7.4f %7.4f %9.1f %11.3f %10.3f %7.3f %7.4f\n', ...
+                nombres{c}, met.k, met.Es, met.Eb, met.Rb, met.B, met.B99, met.eta, met.P);
+    end
+
+    figure('Name','Parte 5 - Eficiencia espectral','Position',[100 100 950 380]);
+    subplot(1,2,1);
+    bar(etas); grid on;
+    set(gca, 'XTick', 1:nL, 'XTickLabel', nombres, 'XTickLabelRotation', 30);
+    ylabel('\eta = R_b/B  (bit/s/Hz)');
+    title(sprintf('Eficiencia espectral, \\beta = %.2f', P.beta));
+    subplot(1,2,2); hold on;
+    bb = 0:0.05:1;
+    for kk = 2:4
+        plot(bb, kk ./ (1 + bb), 'DisplayName', sprintf('k = %d bits/simbolo', kk));
+    end
+    plot(P.beta, log2(P.M)/(1+P.beta), 'ko', 'MarkerFaceColor', 'k', 'DisplayName', 'configuracion actual');
+    grid on; xlabel('\beta'); ylabel('\eta (bit/s/Hz)');
+    title('\eta = k/(1+\beta)'); legend('Location','northeast');
+end
+
+%% =====================================================================
+%  PARTE 6 - BER vs Eb/N0 y tabla de diferencias de Eb/N0
+%  Para cada BER objetivo se obtiene el Eb/N0 que necesita cada esquema:
+%    (a) TEORIA: se invierte la formula de BER por biseccion (llega a 1e-7).
+%    (b) SIMULACION: Monte Carlo + interpolacion en log10(BER), solo donde
+%        hay suficientes errores contados (normalmente hasta ~1e-4 o 1e-5).
+%  Diferencia de un par {A,B} = EbN0(A) - EbN0(B), en dB. Positiva: A necesita
+%  MAS energia por bit que B para la misma BER.
+%  La simulacion usa simbolos directos: en la Parte 3 se comprobo que da la
+%  misma BER que el sistema con pulsos, y es mucho mas rapida.
+% =====================================================================
+if correr_parte6
+    rng(6);
+    fprintf('\n--- PARTE 6: BER y diferencias de Eb/N0 ---\n');
+
+    % ---- Ajustes ----
+    objetivos = [1e-2 1e-3 1e-4 1e-5 1e-6 1e-7];       % BER pedidas en el documento
+    esquemas  = {'4PAM','PAM',4; '4QAM','QAM',4; '4PSK','PSK',4};
+    pares     = {'4PAM','4QAM'; '4PSK','4QAM'; '4QAM','4PAM'};   % tal como esta en la tabla
+    grid6     = 0:1:15;          % Eb/N0 (dB) simulados
+    nBitsMax6 = 2e7;             % maximo de bits por punto (bajalo si tarda mucho)
+    minErr6   = 100;             % se detiene el punto al contar estos errores
+    minConf   = 40;              % errores minimos para usar un punto al interpolar
+    % ----------------
+
+    nE = size(esquemas, 1);  nO = numel(objetivos);  nP = size(pares, 1);
+    ber_sim_c = cell(nE,1);  nerr_c = cell(nE,1);
+    ebn0_teo  = zeros(nE, nO);  ebn0_sim = NaN(nE, nO);
+
+    for e = 1:nE
+        esq = esquemas{e,2};  M = esquemas{e,3};
+        bs = NaN(size(grid6));  ne = zeros(size(grid6));
+        for i = 1:length(grid6)
+            if ber_teorica(M, esq, grid6(i)) < 5/nBitsMax6
+                continue;                                % BER demasiado baja para medirla
+            end
+            [bs(i), ne(i)] = simular_ber(M, esq, grid6(i), nBitsMax6, minErr6);
+        end
+        ber_sim_c{e} = bs;  nerr_c{e} = ne;
+        conf = ne >= minConf;
+        for j = 1:nO
+            ebn0_teo(e,j) = ebn0_requerido_teorico(M, esq, objetivos(j));
+            ebn0_sim(e,j) = ebn0_desde_sim(grid6(conf), bs(conf), objetivos(j));
+        end
+        fprintf('  %s simulado (%d puntos utiles)\n', esquemas{e,1}, sum(conf));
+    end
+
+    % ---- Diferencias para cada par ----
+    dif_teo = zeros(nO, nP);  dif_sim = NaN(nO, nP);  etiq = cell(1, nP);
+    for p = 1:nP
+        iA = find(strcmp(esquemas(:,1), pares{p,1}));
+        iB = find(strcmp(esquemas(:,1), pares{p,2}));
+        dif_teo(:,p) = (ebn0_teo(iA,:) - ebn0_teo(iB,:)).';
+        dif_sim(:,p) = (ebn0_sim(iA,:) - ebn0_sim(iB,:)).';
+        etiq{p} = [pares{p,1} '-' pares{p,2}];
+    end
+
+    % ---- Tablas en consola ----
+    fprintf('\nEb/N0 requerido (dB) - TEORIA\n%-8s', 'BER');
+    for e = 1:nE, fprintf('%10s', esquemas{e,1}); end
+    fprintf('\n');
+    for j = 1:nO
+        fprintf('%-8.0e', objetivos(j));
+        for e = 1:nE, fprintf('%10.3f', ebn0_teo(e,j)); end
+        fprintf('\n');
+    end
+
+    fprintf('\nDiferencia de Eb/N0 (dB) - TEORIA\n%-8s', 'BER');
+    for p = 1:nP, fprintf('%12s', etiq{p}); end
+    fprintf('\n');
+    for j = 1:nO
+        fprintf('%-8.0e', objetivos(j));
+        for p = 1:nP, fprintf('%12.3f', dif_teo(j,p)); end
+        fprintf('\n');
+    end
+
+    fprintf('\nDiferencia de Eb/N0 (dB) - SIMULACION (NaN = BER no alcanzable por Monte Carlo)\n%-8s', 'BER');
+    for p = 1:nP, fprintf('%12s', etiq{p}); end
+    fprintf('\n');
+    for j = 1:nO
+        fprintf('%-8.0e', objetivos(j));
+        for p = 1:nP, fprintf('%12.3f', dif_sim(j,p)); end
+        fprintf('\n');
+    end
+    save('resultados_parte6.mat', 'objetivos', 'esquemas', 'pares', 'ebn0_teo', ...
+         'ebn0_sim', 'dif_teo', 'dif_sim');
+    fprintf('\nResultados guardados en resultados_parte6.mat\n');
+
+    % ---- Grafica 1: curvas BER (simulacion y teoria) con las BER objetivo ----
+    colores = {'b','r','g'};  marc = {'o','s','^'};
+    ebf = 0:0.1:16;
+    figure('Name','Parte 6 - Curvas BER'); hold on;
+    for e = 1:nE
+        esq = esquemas{e,2};  M = esquemas{e,3};
+        conf = nerr_c{e} >= minConf;
+        semilogy(ebf, ber_teorica(M, esq, ebf), '-', 'Color', colores{e}, ...
+                 'DisplayName', [esquemas{e,1} ' teoria']);
+        semilogy(grid6(conf), ber_sim_c{e}(conf), marc{e}, 'Color', colores{e}, ...
+                 'DisplayName', [esquemas{e,1} ' simulada']);
+    end
+    for j = 1:nO
+        semilogy([0 16], [objetivos(j) objetivos(j)], ':', 'Color', [0.5 0.5 0.5], 'HandleVisibility', 'off');
+    end
+    set(gca, 'YScale', 'log'); grid on; xlim([0 16]); ylim([1e-8 1]);
+    xlabel('E_b/N_0 (dB)'); ylabel('BER');
+    title('BER vs E_b/N_0 (lineas punteadas: BER objetivo)'); legend('Location','southwest');
+
+    % ---- Grafica 2: Eb/N0 requerido para cada BER objetivo ----
+    xo = -log10(objetivos);
+    etqx = arrayfun(@(v) sprintf('10^{-%d}', round(v)), xo, 'UniformOutput', false);
+    figure('Name','Parte 6 - Eb/N0 requerido'); hold on;
+    for e = 1:nE
+        plot(xo, ebn0_teo(e,:), '-o', 'Color', colores{e}, 'DisplayName', [esquemas{e,1} ' teoria']);
+        plot(xo, ebn0_sim(e,:), 'x', 'Color', colores{e}, 'MarkerSize', 10, 'LineWidth', 1.5, ...
+             'DisplayName', [esquemas{e,1} ' simulada']);
+    end
+    set(gca, 'XTick', xo, 'XTickLabel', etqx); grid on;
+    xlabel('BER objetivo'); ylabel('E_b/N_0 requerido (dB)');
+    title('E_b/N_0 necesario para cada BER'); legend('Location','northwest');
+
+    % ---- Grafica 3: diferencias de Eb/N0 por par ----
+    figure('Name','Parte 6 - Diferencias de Eb/N0'); hold on;
+    bar(xo, dif_teo);
+    lim = 10*log10(2.5);                              % limite asintotico 4PAM vs 4QAM
+    plot([xo(1)-0.6 xo(end)+0.6], [lim lim], 'k--');
+    for p = 1:nP
+        plot(xo, dif_sim(:,p), 'k*', 'HandleVisibility', 'off');
+    end
+    set(gca, 'XTick', xo, 'XTickLabel', etqx); grid on; xlim([xo(1)-0.6 xo(end)+0.6]);
+    xlabel('BER objetivo'); ylabel('Diferencia de E_b/N_0 (dB)');
+    title('Diferencias (barras: teoria, *: simulacion)');
+    legend([etiq, {'10log_{10}(2.5) = 3.98 dB'}], 'Location','best');
+end
+
+%% =====================================================================
+%  PARTE 7 - Interfaz grafica (RF1-RF4, RNF1)
+%  Abre una ventana con los parametros, las graficas y las metricas.
+%  El codigo de la interfaz esta en la funcion local interfaz_grafica.
+% =====================================================================
+if correr_parte7
+    interfaz_grafica();
+end
+
+end   % fin de la funcion principal Trabajo2Digitales
+
+%% =====================================================================
+%  FUNCIONES LOCALES (siempre al final del archivo)
+% =====================================================================
+
+function s = mapear(bits, M, esquema)
+% Bits -> simbolos complejos con codigo Gray, normalizados a Es = 1.
+    k = log2(M);
+
+    % ---- Validacion de entradas (RNF1) ----
+    if ~isscalar(M) || M < 2 || k ~= floor(k)
+        error('El orden M debe ser una potencia de 2 (2, 4, 8, 16, ...).');
+    end
+    esquema = upper(esquema);
+    if ~any(strcmp(esquema, {'PAM','QAM','PSK'}))
+        error('El esquema debe ser ''PAM'', ''QAM'' o ''PSK''.');
+    end
+    if strcmp(esquema, 'QAM') && mod(k,2) ~= 0
+        error('M-QAM cuadrada requiere M = 4, 16, 64, ... (log2(M) par).');
+    end
+    bits = bits(:).';
+    if any(bits ~= 0 & bits ~= 1)
+        error('El vector de bits solo puede contener 0 y 1.');
+    end
+    if mod(length(bits), k) ~= 0
+        error('La cantidad de bits debe ser multiplo de log2(M) = %d.', k);
+    end
+
+    B = reshape(bits, k, []).';                  % cada fila = un simbolo
+
+    switch esquema
+        case 'PAM'
+            g   = B * (2.^(k-1:-1:0)).';         % Gray en decimal
+            idx = gray_a_binario(g, k);          % posicion del nivel 0..M-1
+            s = (2*idx - (M-1)) * sqrt(3/(M^2 - 1));
+
+        case 'QAM'
+            kh = k/2;  L = sqrt(M);
+            pesos = (2.^(kh-1:-1:0)).';
+            gI = B(:, 1:kh)     * pesos;
+            gQ = B(:, kh+1:end) * pesos;
+            I = 2*gray_a_binario(gI, kh) - (L-1);
+            Q = 2*gray_a_binario(gQ, kh) - (L-1);
+            s = (I + 1j*Q) * sqrt(3/(2*(M-1)));
+
+        case 'PSK'
+            g   = B * (2.^(k-1:-1:0)).';
+            idx = gray_a_binario(g, k);
+            fase0 = 0;
+            if M == 4, fase0 = pi/4; end         % 4-PSK en (+-1 +-j)/sqrt(2)
+            s = exp(1j*(2*pi*idx/M + fase0));
+    end
+end
+
+function b = gray_a_binario(g, nb)
+% Gray (decimal) -> binario natural (decimal): b = g XOR (g>>1) XOR (g>>2)...
+    b = g;
+    t = bitshift(g, -1);
+    for i = 1:nb-1
+        b = bitxor(b, t);
+        t = bitshift(t, -1);
+    end
+end
+
+function [C, Bmat] = constelacion(M, esquema)
+% Los M puntos de la constelacion (columna) y sus bits (fila m = simbolo m).
+    k = log2(M);
+    Bmat = zeros(M, k);
+    for m = 0:M-1
+        Bmat(m+1,:) = bitget(m, k:-1:1);
+    end
+    C = mapear(reshape(Bmat.', 1, []), M, esquema);
+end
+
+function r = canal_awgn(x, EbN0_dB, k)
+% Suma ruido AWGN. Con Es = 1: Eb = 1/k y N0 = Eb/(Eb/N0).
+% Compleja (QAM/PSK): varianza N0/2 en I y en Q. Real (PAM y senal pasa
+% banda): varianza N0/2 por muestra. Valido con simbolos directos o con
+% muestras conformadas, porque los filtros SRRC tienen energia unitaria.
+    EbN0  = 10^(EbN0_dB/10);
+    N0    = (1/k) / EbN0;
+    sigma = sqrt(N0/2);
+    if isreal(x)
+        r = x + sigma*randn(size(x));
+    else
+        r = x + sigma*(randn(size(x)) + 1j*randn(size(x)));
+    end
+end
+
+function bits = decisor(r, M, esquema)
+% Decision de distancia minima: punto de la constelacion mas cercano.
+    [C, Bmat] = constelacion(M, esquema);
+    r = r(:);
+    N = length(r);
+    idx = zeros(N, 1);
+    bloque = 1e5;                                % por bloques para ahorrar memoria
+    for ini = 1:bloque:N
+        fin = min(ini + bloque - 1, N);
+        d = abs(r(ini:fin) - C.');               % distancia a cada punto (n x M)
+        [~, idx(ini:fin)] = min(d, [], 2);
+    end
+    bits = reshape(Bmat(idx,:).', 1, []);
+end
+
+function ber = ber_teorica(M, esquema, EbN0_dB)
+% BER teorica (vecinos mas cercanos, Gray). Q(x) = 0.5*erfc(x/sqrt(2)).
+%  PAM: 2(M-1)/(M k) Q(sqrt(6k/(M^2-1) Eb/N0))
+%  QAM: 4/k (1-1/sqrt(M)) Q(sqrt(3k/(M-1) Eb/N0))
+%  PSK: 2/k Q(sqrt(2k sin^2(pi/M) Eb/N0))   (M=2: Q(sqrt(2 Eb/N0)))
+    k = log2(M);
+    g = 10.^(EbN0_dB/10);
+    Q = @(x) 0.5*erfc(x/sqrt(2));
+    switch upper(esquema)
+        case 'PAM'
+            ber = 2*(M-1)/(M*k) * Q(sqrt(6*k/(M^2-1)*g));
+        case 'QAM'
+            ber = 4/k*(1 - 1/sqrt(M)) * Q(sqrt(3*k/(M-1)*g));
+        case 'PSK'
+            if M == 2
+                ber = Q(sqrt(2*g));
+            else
+                ber = 2/k * Q(sqrt(2*k*sin(pi/M)^2*g));
+            end
+        otherwise
+            error('Esquema no valido.');
+    end
+end
+
+function h = srrc(beta, sps, span)
+% Pulso de raiz de coseno alzado (SRRC), energia unitaria.
+%   beta: roll-off (0..1) | sps: muestras por simbolo | span: largo en simbolos
+%   h(t) = [sin(pi t(1-b)) + 4 b t cos(pi t(1+b))] / [pi t (1-(4 b t)^2)]
+%   t = 0:            h = 1 - b + 4b/pi
+%   |t| = 1/(4b):     h = b/sqrt(2) [(1+2/pi) sin(pi/(4b)) + (1-2/pi) cos(pi/(4b))]
+% Con h en Tx y h en Rx, el pulso total tiene g(0)=1 y ceros en multiplos de Ts.
+    if ~isscalar(beta) || ~isnumeric(beta) || isnan(beta) || beta < 0 || beta > 1
+        error('El factor de roll-off debe ser un numero entre 0 y 1.');
+    end
+    if sps < 2 || sps ~= floor(sps)
+        error('sps debe ser un entero mayor o igual a 2.');
+    end
+    if span < 2 || span ~= floor(span) || mod(span*sps, 2) ~= 0
+        error('span debe ser un entero positivo y span*sps debe ser par.');
+    end
+
+    t = (-span*sps/2 : span*sps/2) / sps;        % tiempo en unidades de Ts
+    h = zeros(size(t));
+    for i = 1:length(t)
+        ti = t(i);
+        if abs(ti) < 1e-9
+            h(i) = 1 - beta + 4*beta/pi;
+        elseif beta > 0 && abs(abs(ti) - 1/(4*beta)) < 1e-9
+            h(i) = beta/sqrt(2) * ( (1+2/pi)*sin(pi/(4*beta)) + (1-2/pi)*cos(pi/(4*beta)) );
+        else
+            h(i) = ( sin(pi*ti*(1-beta)) + 4*beta*ti*cos(pi*ti*(1+beta)) ) ...
+                   / ( pi*ti*(1 - (4*beta*ti)^2) );
+        end
+    end
+    h = h(:) / sqrt(sum(h.^2));                  % energia unitaria
+end
+
+function x = conformar(s, h, sps)
+% Inserta sps-1 ceros entre simbolos y filtra con el pulso h.
+    N = length(s);
+    xup = zeros(N*sps, 1);
+    xup(1:sps:end) = s(:);
+    x = conv(xup, h(:));                         % longitud N*sps + length(h) - 1
+end
+
+function [y, ysym] = receptor_adaptado(r, h, sps, span, N)
+% Filtro adaptado (mismo SRRC) y muestreo cada Ts. Tx y Rx retrasan en total
+% span*sps muestras, asi que el primer simbolo queda en el indice span*sps+1.
+    y = conv(r(:), h(:));
+    ini = span*sps + 1;
+    ysym = y(ini : sps : ini + (N-1)*sps);
+end
+
+function plot_ojo(y, sps, span, nTrazas, titulo)
+% Diagrama del ojo: superpone tramos de 2Ts de la salida del filtro adaptado.
+% y debe ser real (pasa real(y) para I o imag(y) para Q). Decision en t = 0.
+    y = y(:);
+    t = (-sps:sps) / sps;
+    ini = span*sps + 1 + 5*sps;                  % salta el transitorio inicial
+    nTrazas = min(nTrazas, floor((length(y) - sps - ini) / sps));
+    Y = zeros(2*sps + 1, nTrazas);
+    for i = 1:nTrazas
+        c = ini + (i-1)*sps;
+        Y(:, i) = y(c - sps : c + sps);
+    end
+    plot(t, Y, 'Color', [0 0.35 0.8]);
+    grid on; xlabel('t / T_s'); ylabel('Amplitud'); title(titulo);
+end
+
+function xp = modular(x, fc, sps)
+% Modulacion a portadora: xp = sqrt(2) [ xI cos(2 pi fc t) - xQ sin(2 pi fc t) ].
+% fc en unidades de 1/Ts; la frecuencia de muestreo es fs = sps/Ts.
+% El factor sqrt(2) conserva la energia por simbolo (promedio de 2cos^2 = 1).
+    n  = (0:length(x)-1).';
+    th = 2*pi*fc*n/sps;
+    xp = sqrt(2) * (real(x(:)).*cos(th) - imag(x(:)).*sin(th));
+end
+
+function [y, ysym] = demodular(rp, fc, sps, h, span, N, esquema)
+% Demodulacion coherente (portadora y fase perfectamente conocidas).
+% I = sqrt(2) rp cos(th) -> xI + terminos en 2fc ; Q = -sqrt(2) rp sin(th) -> xQ.
+% El filtro adaptado SRRC elimina los terminos en 2fc. PAM solo usa la rama I.
+    rp = rp(:);
+    n  = (0:length(rp)-1).';
+    th = 2*pi*fc*n/sps;
+    rI = sqrt(2) * rp .* cos(th);
+    rQ = -sqrt(2) * rp .* sin(th);
+    if strcmpi(esquema, 'PAM')
+        rb = rI;
+    else
+        rb = rI + 1j*rQ;
+    end
+    [y, ysym] = receptor_adaptado(rb, h, sps, span, N);
+end
+
+function [f, Pdb] = psd_welch(x, fs, nfft)
+% Densidad espectral por promedio de periodogramas (Welch) con ventana de
+% Hann y solape del 50%. f en las mismas unidades que fs (aqui 1/Ts).
+% Pdb esta normalizada a su maximo (0 dB).
+    x = x(:);
+    w = 0.5 - 0.5*cos(2*pi*(0:nfft-1).'/nfft);   % ventana de Hann
+    paso = nfft/2;
+    acc = zeros(nfft, 1);
+    cnt = 0;
+    for i = 1:paso:length(x) - nfft + 1
+        seg = x(i:i+nfft-1) .* w;
+        acc = acc + abs(fft(seg)).^2;
+        cnt = cnt + 1;
+    end
+    P   = fftshift(acc / cnt);
+    f   = ((-nfft/2):(nfft/2 - 1)).' * fs / nfft;
+    Pdb = 10*log10(P / max(P));
+end
+
+%% ---------------------------------------------------------------------
+%  INTERFAZ GRAFICA (Parte 7)
+% ---------------------------------------------------------------------
+
+function interfaz_grafica()
+% Ventana interactiva. Cada cambio de parametro actualiza de inmediato el
+% ojo, la constelacion, los espectros y las metricas. La curva BER vs Eb/N0
+% (mas lenta) se calcula con el boton "Calcular curva BER".
+    fig = figure('Name', 'Simulador de comunicaciones digitales: M-PAM / M-QAM / M-PSK', ...
+                 'NumberTitle', 'off', 'Units', 'normalized', ...
+                 'Position', [0.03 0.06 0.94 0.86]);
+    H.fig = fig;
+
+    % ---------- Panel de parametros ----------
+    pan = uipanel(fig, 'Title', 'Parametros', 'Units', 'normalized', ...
+                  'Position', [0.005 0.34 0.215 0.655]);
+    etiqueta(pan, 0.89, 'Esquema de modulacion');
+    H.popEsq = uicontrol(pan, 'Style', 'popupmenu', 'String', {'M-PAM','M-QAM','M-PSK'}, ...
+                         'Value', 2, 'Units', 'normalized', 'Position', [0.05 0.84 0.9 0.05], ...
+                         'Callback', @(~,~) actualizar(fig, false));
+    etiqueta(pan, 0.78, 'Orden M (potencia de 2)');
+    H.edM    = campo(pan, 0.73, '4',    fig);
+    etiqueta(pan, 0.67, 'Factor de roll-off (0 a 1)');
+    H.edBeta = campo(pan, 0.62, '0.35', fig);
+    etiqueta(pan, 0.56, 'Eb/N0 (dB) para ojo/constelacion');
+    H.edEbN0 = campo(pan, 0.51, '12',   fig);
+    etiqueta(pan, 0.45, 'Numero de simbolos (200 a 50000)');
+    H.edN    = campo(pan, 0.40, '3000', fig);
+    etiqueta(pan, 0.34, 'Portadora fc (en unidades de 1/Ts)');
+    H.edFc   = campo(pan, 0.29, '2',    fig);
+
+    uicontrol(pan, 'Style', 'pushbutton', 'String', 'Actualizar graficas', ...
+              'Units', 'normalized', 'Position', [0.05 0.19 0.9 0.07], ...
+              'Callback', @(~,~) actualizar(fig, false));
+    uicontrol(pan, 'Style', 'pushbutton', 'String', 'Calcular curva BER (mas lenta)', ...
+              'Units', 'normalized', 'Position', [0.05 0.11 0.9 0.07], ...
+              'Callback', @(~,~) actualizar(fig, true));
+    uicontrol(pan, 'Style', 'pushbutton', 'String', 'Valores iniciales', ...
+              'Units', 'normalized', 'Position', [0.05 0.03 0.9 0.07], ...
+              'Callback', @(~,~) valores_iniciales(fig));
+
+    % ---------- Panel de metricas y linea de estado ----------
+    panM = uipanel(fig, 'Title', 'Metricas', 'Units', 'normalized', ...
+                   'Position', [0.005 0.005 0.215 0.33]);
+    H.txtMet = uicontrol(panM, 'Style', 'text', 'Units', 'normalized', ...
+                         'Position', [0.03 0.03 0.94 0.94], 'HorizontalAlignment', 'left', ...
+                         'FontName', 'FixedWidth', 'FontSize', 9, ...
+                         'BackgroundColor', get(panM, 'BackgroundColor'));
+    H.txtEstado = uicontrol(fig, 'Style', 'text', 'Units', 'normalized', ...
+                            'Position', [0.23 0.005 0.76 0.03], 'HorizontalAlignment', 'left', ...
+                            'String', 'Listo.', 'BackgroundColor', get(fig, 'Color'));
+
+    % ---------- Ejes (2 filas x 3 columnas) ----------
+    H.axEyeI  = axes('Parent', fig, 'Units', 'normalized', 'Position', [0.255 0.57 0.215 0.34]);
+    H.axEyeQ  = axes('Parent', fig, 'Units', 'normalized', 'Position', [0.500 0.57 0.215 0.34]);
+    H.axConst = axes('Parent', fig, 'Units', 'normalized', 'Position', [0.745 0.57 0.215 0.34]);
+    H.axBER   = axes('Parent', fig, 'Units', 'normalized', 'Position', [0.255 0.10 0.215 0.34]);
+    H.axSpTx  = axes('Parent', fig, 'Units', 'normalized', 'Position', [0.500 0.10 0.215 0.34]);
+    H.axSpRx  = axes('Parent', fig, 'Units', 'normalized', 'Position', [0.745 0.10 0.215 0.34]);
+
+    H.claveBER = '';
+    H.prev = capturar(H);
+    guidata(fig, H);
+    actualizar(fig, true);                        % primera simulacion al abrir
+end
+
+function etiqueta(parent, y, txt)
+    uicontrol(parent, 'Style', 'text', 'String', txt, 'Units', 'normalized', ...
+              'Position', [0.05 y 0.9 0.04], 'HorizontalAlignment', 'left', ...
+              'BackgroundColor', get(parent, 'BackgroundColor'));
+end
+
+function h = campo(parent, y, txt, fig)
+    h = uicontrol(parent, 'Style', 'edit', 'String', txt, 'Units', 'normalized', ...
+                  'Position', [0.05 y 0.9 0.05], ...
+                  'Callback', @(~,~) actualizar(fig, false));
+end
+
+function prev = capturar(H)
+% Guarda los valores actuales de los campos (para restaurarlos si el usuario
+% escribe algo no permitido).
+    prev.esq  = get(H.popEsq, 'Value');
+    prev.M    = get(H.edM,    'String');
+    prev.beta = get(H.edBeta, 'String');
+    prev.EbN0 = get(H.edEbN0, 'String');
+    prev.N    = get(H.edN,    'String');
+    prev.fc   = get(H.edFc,   'String');
+end
+
+function restaurar_campos(H)
+    set(H.popEsq, 'Value',  H.prev.esq);
+    set(H.edM,    'String', H.prev.M);
+    set(H.edBeta, 'String', H.prev.beta);
+    set(H.edEbN0, 'String', H.prev.EbN0);
+    set(H.edN,    'String', H.prev.N);
+    set(H.edFc,   'String', H.prev.fc);
+end
+
+function valores_iniciales(fig)
+    H = guidata(fig);
+    set(H.popEsq, 'Value', 2);
+    set(H.edM, 'String', '4');       set(H.edBeta, 'String', '0.35');
+    set(H.edEbN0, 'String', '12');   set(H.edN, 'String', '3000');
+    set(H.edFc, 'String', '2');
+    actualizar(fig, true);
+end
+
+function [p, msg] = leer_parametros(H)
+% Lee y valida los campos. Si algo no es valido, devuelve el mensaje en 'msg'
+% (RNF1: la aplicacion no se cae, avisa y conserva los valores anteriores).
+    p = [];  msg = '';
+    nombres = {'PAM','QAM','PSK'};
+    esq  = nombres{get(H.popEsq, 'Value')};
+    M    = str2double(get(H.edM,    'String'));
+    beta = str2double(get(H.edBeta, 'String'));
+    EbN0 = str2double(get(H.edEbN0, 'String'));
+    N    = str2double(get(H.edN,    'String'));
+    fc   = str2double(get(H.edFc,   'String'));
+    sps = 8;  span = 10;
+
+    if ~isfinite(M) || M < 2 || M > 64 || abs(log2(M) - round(log2(M))) > 1e-9
+        msg = 'El orden M debe ser una potencia de 2 entre 2 y 64 (2, 4, 8, 16, 32 o 64).';  return;
+    end
+    if strcmp(esq, 'QAM') && mod(round(log2(M)), 2) ~= 0
+        msg = 'M-QAM cuadrada requiere M = 4, 16 o 64.';  return;
+    end
+    if ~isfinite(beta) || beta < 0 || beta > 1
+        msg = 'El factor de roll-off debe ser un numero entre 0 y 1.';  return;
+    end
+    if ~isfinite(EbN0) || EbN0 < -5 || EbN0 > 30
+        msg = 'Eb/N0 debe ser un numero entre -5 y 30 dB.';  return;
+    end
+    if ~isfinite(N) || N ~= round(N) || N < 200 || N > 50000
+        msg = 'El numero de simbolos debe ser un entero entre 200 y 50000.';  return;
+    end
+    media_bw = (1 + beta) / 2;
+    if ~isfinite(fc) || fc <= media_bw || fc >= sps/2 - media_bw
+        msg = sprintf(['La portadora fc debe estar entre %.3f y %.3f (en unidades de 1/Ts) ' ...
+                       'para roll-off = %.2f.'], media_bw, sps/2 - media_bw, beta);
+        return;
+    end
+    p = struct('esq', esq, 'M', M, 'beta', beta, 'EbN0', EbN0, 'N', N, ...
+               'fc', fc, 'sps', sps, 'span', span);
+end
+
+function actualizar(fig, conBER)
+    H = guidata(fig);
+    [p, msg] = leer_parametros(H);
+    if ~isempty(msg)
+        restaurar_campos(H);                      % vuelve a los ultimos valores validos
+        set(H.txtEstado, 'String', ['Entrada no valida: ' msg], 'ForegroundColor', [0.8 0 0]);
+        errordlg(msg, 'Entrada no valida', 'modal');
+        return;
+    end
+    H.prev = capturar(H);
+    guidata(fig, H);
+
+    try
+        set(fig, 'Pointer', 'watch');
+        set(H.txtEstado, 'String', 'Calculando...', 'ForegroundColor', [0 0 0]);
+        drawnow;
+        simular_y_graficar(H, p);
+        if conBER
+            graficar_ber(H, p);
+        elseif ~strcmp(H.claveBER, clave_ber(p))
+            limpiar_ber(H);                       % la curva BER mostrada ya no corresponde
+        end
+        set(H.txtEstado, 'String', 'Listo.', 'ForegroundColor', [0 0 0]);
+    catch err
+        set(H.txtEstado, 'String', ['Error: ' err.message], 'ForegroundColor', [0.8 0 0]);
+        errordlg(err.message, 'Error en la simulacion', 'modal');
+    end
+    set(fig, 'Pointer', 'arrow');
+end
+
+function simular_y_graficar(H, p)
+% Cadena completa: bits -> mapeo -> SRRC -> portadora -> AWGN ->
+% demodulacion coherente -> filtro adaptado -> muestreo -> decisor.
+    rng(1);                                       % RNF3: mismos parametros, mismo resultado
+    k    = log2(p.M);
+    h    = srrc(p.beta, p.sps, p.span);
+    bits = randi([0 1], 1, p.N*k);
+    s    = mapear(bits, p.M, p.esq);
+    x    = conformar(s, h, p.sps);                % banda base (Tx)
+    xp   = modular(x, p.fc, p.sps);               % pasa banda (Tx)
+    rp   = canal_awgn(xp, p.EbN0, k);             % pasa banda (Rx), con ruido
+    [y, ys] = demodular(rp, p.fc, p.sps, h, p.span, p.N, p.esq);
+    bitsRx = decisor(ys, p.M, p.esq);
+    nErr   = sum(bitsRx ~= bits);
+
+    % ---- Diagrama del ojo en recepcion ----
+    set(H.fig, 'CurrentAxes', H.axEyeI);  cla(H.axEyeI, 'reset');
+    plot_ojo(real(y), p.sps, p.span, 200, 'Ojo en recepcion (I)');
+    set(H.fig, 'CurrentAxes', H.axEyeQ);  cla(H.axEyeQ, 'reset');
+    if strcmp(p.esq, 'PAM')
+        set(H.axEyeQ, 'XTick', [], 'YTick', []);
+        title('Ojo Q: no aplica a M-PAM');
+    else
+        plot_ojo(imag(y), p.sps, p.span, 200, 'Ojo en recepcion (Q)');
+    end
+
+    % ---- Constelacion en recepcion ----
+    set(H.fig, 'CurrentAxes', H.axConst);  cla(H.axConst, 'reset');  hold on;
+    plot(real(ys), imag(ys), '.', 'Color', [0.3 0.5 0.9], 'MarkerSize', 4);
+    C = constelacion(p.M, p.esq);
+    plot(real(C), imag(C), 'r+', 'MarkerSize', 10, 'LineWidth', 2);
+    grid on;  xlabel('I');  ylabel('Q');
+    title(sprintf('Constelacion recibida %d-%s', p.M, p.esq));
+    if strcmp(p.esq, 'PAM'), ylim([-1 1]); else, axis equal; end
+
+    % ---- Espectros: banda base (Tx) y pasa banda (Rx) ----
+    bw = (1 + p.beta) / 2;
+    [fb, Pb] = psd_welch(x,  p.sps, 1024);
+    set(H.fig, 'CurrentAxes', H.axSpTx);  cla(H.axSpTx, 'reset');  hold on;
+    plot(fb, Pb, 'b');
+    plot([-bw -bw], [-80 5], 'r--');  plot([bw bw], [-80 5], 'r--');
+    xlim([-3 3]);  ylim([-80 5]);  grid on;
+    xlabel('f T_s');  ylabel('Densidad espectral (dB, norm.)');
+    title('Espectro en banda base (Tx)');
+
+    [fp, Pp] = psd_welch(rp, p.sps, 1024);
+    set(H.fig, 'CurrentAxes', H.axSpRx);  cla(H.axSpRx, 'reset');  hold on;
+    plot(fp, Pp, 'm');
+    plot([p.fc-bw p.fc-bw], [-80 5], 'r--');  plot([p.fc+bw p.fc+bw], [-80 5], 'r--');
+    xlim([0 p.sps/2]);  ylim([-80 5]);  grid on;
+    xlabel('f T_s');  ylabel('Densidad espectral (dB, norm.)');
+    title('Espectro pasa banda (Rx)');
+
+    % ---- Metricas ----
+    met = calcular_metricas(p.M, p.beta, x, xp, p.N, p.sps);
+    lineas = { ...
+        sprintf('Esquema: %d-%s  (k = %d bits/simbolo)', p.M, p.esq, k); ...
+        sprintf('Energia de simbolo Es = %.4f', met.Es); ...
+        sprintf('Energia por bit    Eb = %.4f', met.Eb); ...
+        sprintf('Tasa de bits Rb = %g Rs', met.Rb); ...
+        sprintf('Ancho de banda B = %.3f Rs', met.B); ...
+        sprintf('  (99%% de potencia: %.3f Rs)', met.B99); ...
+        sprintf('Eficiencia espectral = %.3f bit/s/Hz', met.eta); ...
+        sprintf('Potencia modulada P = %.4f', met.P); ...
+        '  (unidades normalizadas: Ts = 1)'; ...
+        ' '; ...
+        sprintf('Eb/N0 = %g dB', p.EbN0); ...
+        sprintf('BER simulada = %.2e (%d errores / %d bits)', nErr/length(bits), nErr, length(bits)); ...
+        sprintf('BER teorica   = %.2e', ber_teorica(p.M, p.esq, p.EbN0))};
+    set(H.txtMet, 'String', lineas);
+end
+
+function graficar_ber(H, p)
+% Curva BER vs Eb/N0 del sistema completo (pulsos SRRC + portadora) y teoria.
+    set(H.txtEstado, 'String', 'Calculando curva BER (puede tardar unos segundos)...', ...
+                     'ForegroundColor', [0 0 0]);
+    drawnow;
+    rng(1);
+    grid_dB = 0:2:16;
+    sim = NaN(size(grid_dB));
+    nMax = 5e5;                                   % bits maximos por punto
+    for i = 1:length(grid_dB)
+        if ber_teorica(p.M, p.esq, grid_dB(i)) < 5/nMax
+            continue;                             % BER demasiado baja para medirla aqui
+        end
+        [b, ne] = simular_ber(p.M, p.esq, grid_dB(i), nMax, 50, p.beta, p.fc);
+        if ne >= 10, sim(i) = b; end
+    end
+    ebf = 0:0.1:16;
+    set(H.fig, 'CurrentAxes', H.axBER);  cla(H.axBER, 'reset');  hold on;
+    semilogy(ebf, ber_teorica(p.M, p.esq, ebf), 'k-');
+    ok = ~isnan(sim);
+    semilogy(grid_dB(ok), sim(ok), 'ro', 'MarkerFaceColor', 'r');
+    set(H.axBER, 'YScale', 'log');
+    grid on;  xlim([0 16]);  ylim([1e-6 1]);
+    xlabel('E_b/N_0 (dB)');  ylabel('BER');
+    title(sprintf('BER vs E_b/N_0 (%d-%s, \\beta = %.2f)', p.M, p.esq, p.beta));
+    legend('Teoria', 'Simulada (sistema completo)', 'Location', 'southwest');
+
+    H.claveBER = clave_ber(p);
+    guidata(H.fig, H);
+end
+
+function limpiar_ber(H)
+    set(H.fig, 'CurrentAxes', H.axBER);  cla(H.axBER, 'reset');
+    set(H.axBER, 'XTick', [], 'YTick', []);
+    title('BER vs E_b/N_0');
+    text(0.5, 0.5, 'Pulsa "Calcular curva BER" para actualizarla', ...
+         'Units', 'normalized', 'HorizontalAlignment', 'center');
+    H.claveBER = '';
+    guidata(H.fig, H);
+end
+
+function c = clave_ber(p)
+% Identifica los parametros de los que depende la curva BER.
+    c = sprintf('%s|%d|%.6f|%.6f', p.esq, p.M, p.beta, p.fc);
+end
+
+function validar_portadora(beta, fc, sps)
+% La portadora debe dejar la banda (fc +- (1+beta)/2) entre 0 y fs/2 = sps/2.
+    media_bw = (1 + beta) / 2;
+    if fc <= media_bw || fc >= sps/2 - media_bw
+        error(['La portadora fc debe cumplir (1+beta)/2 < fc < sps/2 - (1+beta)/2 ' ...
+               '(en unidades de 1/Ts). Con beta=%.2f y sps=%d: %.3f < fc < %.3f.'], ...
+               beta, sps, media_bw, sps/2 - media_bw);
+    end
+end
+
+function met = calcular_metricas(M, beta, x, xp, N, sps)
+% Metricas con Ts = 1 (Rs = 1/Ts = 1), Es = 1. Ver definiciones en la Parte 5.
+%   x  : senal en banda base (salida de conformar), xp : senal pasa banda.
+    k  = log2(M);
+    Ts = 1;
+    met.k   = k;
+    met.Es  = sum(abs(x).^2) / N;                % energia por simbolo (medida)
+    met.Eb  = met.Es / k;                        % energia por bit
+    met.Rb  = k / Ts;                            % tasa de bits
+    met.B   = (1 + beta) / Ts;                   % ancho de banda de la senal pasa banda
+    met.eta = met.Rb / met.B;                    % eficiencia espectral
+    met.P   = sum(xp.^2) / (N*Ts);               % potencia promedio de la senal modulada
+
+    % Ancho de banda medido: entre el 0.5% y el 99.5% de la potencia (f > 0)
+    [f, Pdb] = psd_welch(xp, sps, 1024);
+    pos = f > 0;
+    fp  = f(pos);
+    Pp  = 10.^(Pdb(pos)/10);
+    c   = cumsum(Pp) / sum(Pp);
+    met.B99 = fp(find(c >= 0.995, 1)) - fp(find(c >= 0.005, 1));
+end
+
+function eb = ebn0_requerido_teorico(M, esquema, objetivo)
+% Eb/N0 (dB) con el que la BER teorica iguala 'objetivo', por biseccion
+% (la BER teorica es decreciente en Eb/N0).
+    lo = 0;  hi = 40;
+    for it = 1:60
+        mid = (lo + hi) / 2;
+        if ber_teorica(M, esquema, mid) > objetivo
+            lo = mid;
+        else
+            hi = mid;
+        end
+    end
+    eb = (lo + hi) / 2;
+end
+
+function eb = ebn0_desde_sim(ebn0, ber, objetivo)
+% Eb/N0 (dB) donde la BER simulada cruza 'objetivo': interpolacion lineal de
+% Eb/N0 contra log10(BER). Devuelve NaN si el objetivo queda fuera del rango
+% simulado (no se extrapola).
+    if numel(ber) < 2
+        eb = NaN;  return;
+    end
+    lb = log10(ber(:));
+    e  = ebn0(:);
+    [lb, ord] = sort(lb);
+    e  = e(ord);
+    lt = log10(objetivo);
+    if lt < lb(1) || lt > lb(end)
+        eb = NaN;  return;
+    end
+    eb = interp1(lb, e, lt);
+end
+
+function [ber, nErr, nBits] = simular_ber(M, esquema, EbN0_dB, nBitsMax, minErr, beta, fc)
+% Monte Carlo de la BER para un valor de Eb/N0.
+%   simular_ber(M,esq,EbN0,nBitsMax,minErr)            simbolos directos
+%   simular_ber(M,esq,EbN0,nBitsMax,minErr,beta)       con SRRC en Tx y Rx
+%   simular_ber(M,esq,EbN0,nBitsMax,minErr,beta,fc)    con SRRC y portadora fc
+% Se detiene al llegar a nBitsMax bits o a minErr errores.
+    k = log2(M);
+    sps = 8;  span = 10;
+    usarPulsos    = (nargin >= 6) && ~isempty(beta);
+    usarPortadora = (nargin >= 7) && ~isempty(fc);
+    if usarPortadora && ~usarPulsos
+        error('Para usar portadora se necesita tambien el roll-off beta.');
+    end
+    if usarPulsos
+        h = srrc(beta, sps, span);
+    end
+
+    Nsym = 50000;                                % simbolos por bloque
+    nErr = 0;  nBits = 0;
+    while nBits < nBitsMax && nErr < minErr
+        bits = randi([0 1], 1, Nsym*k);
+        s = mapear(bits, M, esquema);
+        if usarPulsos
+            x = conformar(s, h, sps);
+            if usarPortadora
+                xp = modular(x, fc, sps);
+                r  = canal_awgn(xp, EbN0_dB, k);
+                [~, rs] = demodular(r, fc, sps, h, span, Nsym, esquema);
+            else
+                r  = canal_awgn(x, EbN0_dB, k);
+                [~, rs] = receptor_adaptado(r, h, sps, span, Nsym);
+            end
+        else
+            rs = canal_awgn(s, EbN0_dB, k);
+        end
+        bitsRx = decisor(rs, M, esquema);
+        nErr  = nErr  + sum(bitsRx ~= bits);
+        nBits = nBits + length(bits);
+    end
+    ber = nErr / nBits;
+end
