@@ -1,11 +1,4 @@
 %% =====================================================================
-%  PROYECTO II - Simulacion de un sistema de comunicacion digital
-%  Universidad del Cauca - Comunicaciones Digitales
-%  Archivo unico: las PARTES van arriba y las FUNCIONES al final.
-%  (Las funciones locales deben ir siempre despues de todo el codigo
-%   del script; al agregar partes nuevas, insertalas antes de "FUNCIONES".)
-%  Requiere MATLAB R2016b o posterior.
-%
 %  PARTE 1: mapeo (Gray)            PARTE 3: pulsos SRRC, ojo, constelacion
 %  PARTE 2: canal AWGN, decisor, BER PARTE 4: portadora, demodulacion, espectros
 %  PARTE 5: metricas (Es, B, eficiencia, potencia)
@@ -19,7 +12,6 @@
 function Trabajo2Digitales()
 clc; close all;
 rng(1);                              % semilla fija (RNF3: reproducibilidad)
-
 correr_parte1 = true;                % pon false para saltarte una parte
 correr_parte2 = true;                % (la parte 2 es la mas lenta)
 correr_parte3 = true;
@@ -52,7 +44,8 @@ if correr_parte1
     figure('Name','Parte 1 - Constelaciones','Position',[100 100 1000 600]);
 
     for c = 1:size(config,1)
-        esq = config{c,1};  M = config{c,2};  k = log2(M);
+        esq = config{c,1};  M = config{c,2};  
+        k = log2(M);
 
         [s, Bmat] = constelacion(M, esq);          % todos los simbolos y sus bits
 
@@ -734,8 +727,8 @@ end
 
 function interfaz_grafica()
 % Ventana interactiva. Cada cambio de parametro actualiza de inmediato el
-% ojo, la constelacion, los espectros y las metricas. La curva BER vs Eb/N0
-% (mas lenta) se calcula con el boton "Calcular curva BER".
+% ojo, la constelacion, los espectros, las metricas y la curva BER vs Eb/N0
+% (esta ultima se recalcula solo si cambia esquema, M, roll-off o fc).
     fig = figure('Name', 'Simulador de comunicaciones digitales: M-PAM / M-QAM / M-PSK', ...
                  'NumberTitle', 'off', 'Units', 'normalized', ...
                  'Position', [0.03 0.06 0.94 0.86]);
@@ -762,7 +755,7 @@ function interfaz_grafica()
     uicontrol(pan, 'Style', 'pushbutton', 'String', 'Actualizar graficas', ...
               'Units', 'normalized', 'Position', [0.05 0.19 0.9 0.07], ...
               'Callback', @(~,~) actualizar(fig, false));
-    uicontrol(pan, 'Style', 'pushbutton', 'String', 'Calcular curva BER (mas lenta)', ...
+    uicontrol(pan, 'Style', 'pushbutton', 'String', 'Recalcular curva BER',...
               'Units', 'normalized', 'Position', [0.05 0.11 0.9 0.07], ...
               'Callback', @(~,~) actualizar(fig, true));
     uicontrol(pan, 'Style', 'pushbutton', 'String', 'Valores iniciales', ...
@@ -778,7 +771,7 @@ function interfaz_grafica()
                          'BackgroundColor', get(panM, 'BackgroundColor'));
     H.txtEstado = uicontrol(fig, 'Style', 'text', 'Units', 'normalized', ...
                             'Position', [0.23 0.005 0.76 0.03], 'HorizontalAlignment', 'left', ...
-                            'String', 'Listo.', 'BackgroundColor', get(fig, 'Color'));
+                            'String', '', 'BackgroundColor', get(fig, 'Color'));
 
     % ---------- Ejes (2 filas x 3 columnas) ----------
     H.axEyeI  = axes('Parent', fig, 'Units', 'normalized', 'Position', [0.255 0.57 0.215 0.34]);
@@ -890,12 +883,13 @@ function actualizar(fig, conBER)
         set(H.txtEstado, 'String', 'Calculando...', 'ForegroundColor', [0 0 0]);
         drawnow;
         simular_y_graficar(H, p);
-        if conBER
+        % La curva BER solo depende de esquema, M, roll-off y fc (no de Eb/N0
+        % ni del numero de simbolos). Se recalcula sola si alguno de esos cambio;
+        % el boton "Recalcular curva BER" fuerza el calculo.
+        if conBER || ~strcmp(H.claveBER, clave_ber(p))
             graficar_ber(H, p);
-        elseif ~strcmp(H.claveBER, clave_ber(p))
-            limpiar_ber(H);                       % la curva BER mostrada ya no corresponde
         end
-        set(H.txtEstado, 'String', 'Listo.', 'ForegroundColor', [0 0 0]);
+        set(H.txtEstado, 'String', '', 'ForegroundColor', [0 0 0]);
     catch err
         set(H.txtEstado, 'String', ['Error: ' err.message], 'ForegroundColor', [0.8 0 0]);
         errordlg(err.message, 'Error en la simulacion', 'modal');
@@ -977,18 +971,17 @@ end
 
 function graficar_ber(H, p)
 % Curva BER vs Eb/N0 del sistema completo (pulsos SRRC + portadora) y teoria.
-    set(H.txtEstado, 'String', 'Calculando curva BER (puede tardar unos segundos)...', ...
-                     'ForegroundColor', [0 0 0]);
+    set(H.txtEstado, 'String', 'Actualizando curva BER...', 'ForegroundColor', [0 0 0]);
     drawnow;
     rng(1);
     grid_dB = 0:2:16;
     sim = NaN(size(grid_dB));
-    nMax = 5e5;                                   % bits maximos por punto
+    nMax = 2e5;                                   % bits maximos por punto (rapido)
     for i = 1:length(grid_dB)
-        if ber_teorica(p.M, p.esq, grid_dB(i)) < 5/nMax
+        if ber_teorica(p.M, p.esq, grid_dB(i)) < 20/nMax
             continue;                             % BER demasiado baja para medirla aqui
         end
-        [b, ne] = simular_ber(p.M, p.esq, grid_dB(i), nMax, 50, p.beta, p.fc);
+        [b, ne] = simular_ber(p.M, p.esq, grid_dB(i), nMax, 30, p.beta, p.fc);
         if ne >= 10, sim(i) = b; end
     end
     ebf = 0:0.1:16;
@@ -1003,16 +996,6 @@ function graficar_ber(H, p)
     legend('Teoria', 'Simulada (sistema completo)', 'Location', 'southwest');
 
     H.claveBER = clave_ber(p);
-    guidata(H.fig, H);
-end
-
-function limpiar_ber(H)
-    set(H.fig, 'CurrentAxes', H.axBER);  cla(H.axBER, 'reset');
-    set(H.axBER, 'XTick', [], 'YTick', []);
-    title('BER vs E_b/N_0');
-    text(0.5, 0.5, 'Pulsa "Calcular curva BER" para actualizarla', ...
-         'Units', 'normalized', 'HorizontalAlignment', 'center');
-    H.claveBER = '';
     guidata(H.fig, H);
 end
 
